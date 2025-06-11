@@ -1,3 +1,15 @@
+# Flutter/Dart
+**/build/
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+.idea/
+*.iml
+
+
 # Logs
 logs
 *.log
