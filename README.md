@@ -14,6 +14,12 @@ A mobile app that allows users to:
 - Control smart devices remotely (via smart switches)
 - Get notified on unusual power usage patterns
 
+## 🎬 Demo Video
+
+Download the full demo:  
+[📥 PowerPulse - Demo (MP4 ZIP)](PowerPulse%20-%20Demo-mp4.zip)
+
+
 ### UI Tools:
 - `fl_chart` – for usage graphs
 - `percent_indicator` – for circular usage indicators
@@ -71,6 +77,7 @@ MongoDB Atlas – cloud database
 MQTT – data communication from smart switches
 
 JSON – offline fallback storage
+
 
 
 
