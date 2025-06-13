@@ -15,9 +15,9 @@ A mobile app that allows users to:
 - Get notified on unusual power usage patterns
 
 ## 🎬 Demo Video
+provided inside the demo folder for better understanding on how the app works
+[📥 Download Demo (ZIP)](PowerPulse%20-%20Demo-mp4.zip)
 
-Download the full demo:  
-[📥 PowerPulse - Demo (MP4 ZIP)](PowerPulse%20-%20Demo-mp4.zip)
 
 
 ### UI Tools:
