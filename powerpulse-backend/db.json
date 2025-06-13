@@ -1,0 +1,18 @@
+[
+  {
+    "deviceId": "a0dd6c4a81fc",
+    "userId": "682e26d2445acdd4fc4d9356",
+    "timeStamp": "2025-05-21T22:38:27.154Z",
+    "topic": "shellyplugus-a0dd6c4a81fc/events/rpc",
+    "current": 0.5,
+    "_id": "682e55e3e7c95b2b78883a55"
+  },
+  {
+    "deviceId": "a0dd6c4a81fc",
+    "userId": "682e26d2445acdd4fc4d9356",
+    "timeStamp": "2025-05-21T22:38:27.192Z",
+    "topic": "shellyplugus-a0dd6c4a81fc/events/rpc",
+    "power": 53.9,
+    "_id": "682e55e3e7c95b2b78883a56"
+  }
+]

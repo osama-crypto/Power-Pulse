@@ -1,0 +1,744 @@
+import http from 'http';
+import url from 'url';
+import WebSocket from 'ws'; // Import the ws library
+import mqtt from 'mqtt';
+import { MongoClient, ObjectId } from 'mongodb';
+import dotenv from 'dotenv';
+import jwt from 'jsonwebtoken'; // For JWT verification
+
+dotenv.config();
+
+// --- MongoDB Connection ---
+const mongoClient = new MongoClient(process.env.MONGO_URI_CLOUD);
+let db;
+
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key-please-set-in-env';
+if (JWT_SECRET === 'fallback-secret-key-please-set-in-env') {
+  console.warn("[SECURITY WARNING] JWT_SECRET is using a fallback value. Please set a strong, unique secret in your .env file.");
+}
+
+// --- MQTT Client (for subscribing to Shelly device data) ---
+const mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL, {
+  username: process.env.MQTT_USERNAME,
+  password: process.env.MQTT_PASSWORD,
+  keepalive: 60,
+  clientId: `mqtt_subscriber_${Math.random().toString(16).substr(2, 8)}`,
+  reconnectPeriod: 5000,
+  connectTimeout: 10000
+});
+
+// --- WebSocket Server ---
+// Using 'noServer: true' allows us to attach the WebSocket server to the existing HTTP server.
+const wss = new WebSocket.Server({ noServer: true });
+
+// Map to store active WebSocket connections, categorized by userId
+// A userId can have multiple active connections (e.g., from different devices)
+const activeWsConnections = new Map(); // Map: userId -> Set of WebSocket clients
+
+// --- WebSocket Event Handlers ---
+wss.on('connection', async (ws, request) => {
+  console.log('[WebSocket] Client connected.');
+
+  // Store client info for debugging or future features
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('message', async (message) => {
+    try {
+      const parsedMessage = JSON.parse(message);
+      if (parsedMessage.type === 'auth' && parsedMessage.token) {
+        jwt.verify(parsedMessage.token, JWT_SECRET, async (err, userPayload) => {
+          if (err) {
+            console.warn('[WebSocket] Auth failed for token:', err.message);
+            ws.send(JSON.stringify({ type: 'auth_error', message: 'Authentication failed' }));
+            ws.close();
+            return;
+          }
+          ws.userId = userPayload.id; // Attach userId to the WebSocket connection
+          console.log(`[WebSocket] Client authenticated. User ID: ${ws.userId}`);
+
+          // Add WebSocket to the active connections map
+          if (!activeWsConnections.has(ws.userId)) {
+            activeWsConnections.set(ws.userId, new Set());
+          }
+          activeWsConnections.get(ws.userId).add(ws);
+
+          ws.send(JSON.stringify({ type: 'auth_success', message: 'Authenticated' }));
+
+          // --- Initial Data Sync after Authentication ---
+          // Send current power/energy and all device statuses to the newly connected client
+          try {
+            if (!db) {
+              console.error("[WebSocket] DB not initialized during initial data sync for user:", ws.userId);
+              return;
+            }
+            // Get latest overall power and energy
+            const latestPowerEnergy = await db.collection(process.env.COLLECTION_NAME)
+              .find({ userId: new ObjectId(ws.userId) })
+              .sort({ timeStamp: -1 })
+              .limit(1)
+              .next();
+
+            if (latestPowerEnergy) {
+              ws.send(JSON.stringify({
+                type: 'current_power_update',
+                payload: {
+                  power: latestPowerEnergy.power || 0,
+                  // Energy should already be in kWh from DB
+                  energy: latestPowerEnergy.energy || 0,
+                  timeStamp: latestPowerEnergy.timeStamp || new Date(),
+                }
+              }));
+              console.log(`[WebSocket] Sent initial power/energy for user ${ws.userId}`);
+            }
+
+            // Get all registered devices for the user with their current status
+            const userDevices = await db.collection('devices')
+              .find({ userId: new ObjectId(ws.userId) })
+              .toArray();
+
+            const devicesWithStatus = userDevices.map(device => ({
+                // Explicitly list fields to send to client for clarity and control
+                id: device.id,
+                name: device.name,
+                // Ensure status is boolean, default to false if not set or not boolean
+                status: typeof device.status === 'boolean' ? device.status : false
+            }));
+
+            ws.send(JSON.stringify({
+              type: 'initial_devices_update', // New type for initial device sync
+              payload: devicesWithStatus
+            }));
+            console.log(`[WebSocket] Sent initial device list for user ${ws.userId} (${devicesWithStatus.length} devices)`);
+
+          } catch (syncErr) {
+            console.error(`[WebSocket] Error sending initial data to user ${ws.userId}:`, syncErr);
+          }
+
+        });
+      } else {
+        // Handle other message types if necessary, or ignore
+        console.log('[WebSocket] Received non-auth message:', parsedMessage);
+      }
+    } catch (parseErr) {
+      console.error('[WebSocket] Failed to parse message:', message, parseErr);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WebSocket] Client disconnected.');
+    if (ws.userId && activeWsConnections.has(ws.userId)) {
+      activeWsConnections.get(ws.userId).delete(ws);
+      if (activeWsConnections.get(ws.userId).size === 0) {
+        activeWsConnections.delete(ws.userId); // Remove user entry if no active connections
+      }
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('[WebSocket] Client error:', error);
+  });
+});
+
+// Ping clients to keep connection alive
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000); // Ping every 30 seconds
+
+// --- MQTT Event Handlers ---
+mqttClient.on('connect', () => {
+  console.log('[MQTT] Connected to MQTT broker.');
+  // Subscribe to Shelly topics
+  // Add specific device topics known to work, plus general ones.
+  const topicsToSubscribe = [
+    'tele/#',     // For devices publishing under a 'tele' prefix
+    'stat/#',     // For devices publishing under a 'stat' prefix
+    'shellies/#', // For Gen1 devices and Gen2/3 devices using the 'shellies' prefix
+    'shellyplugus-a0dd6c4a81fc/#', // Specific subscription for your first device
+    'shellyplugus-a0dd6c27ade0/#', // Specific subscription for your second device
+    // Add other broad, valid wildcard topics if your devices use other known prefixes
+  ];
+  mqttClient.subscribe(topicsToSubscribe, { qos: 0 }, (err) => {
+    if (err) {
+      console.error('[MQTT] Failed to subscribe to topics:', topicsToSubscribe, err);
+    } else {
+      console.log('[MQTT] Subscribed to topics:', topicsToSubscribe);
+    }
+  });
+});
+
+mqttClient.on('error', (err) => {
+  console.error('[MQTT Client Error]', err);
+});
+
+mqttClient.on('message', async (topic, message) => {
+  try {
+    // CRITICAL: Ensure DB is initialized before proceeding with operations that require it
+    if (!db) {
+      console.warn(`[MQTT Message] DB not yet initialized. Skipping processing for topic: ${topic}. Message will be processed once DB is ready if MQTT client buffers or on next similar message.`);
+      return;
+    }
+
+    const msgString = message.toString();
+    // Log raw message first for debugging
+    console.log(`[MQTT RAW Message] Topic: "${topic}", Message: "${msgString.slice(0, 150)}${msgString.length > 150 ? '...' : ''}"`);
+
+    let deviceId = null;
+    let match;
+
+    // Attempt to extract deviceId from common Shelly topic patterns
+    // Pattern 1: shellyplusplugus-HEXID, shellyplugus-HEXID, etc.
+    const shellyGenPattern = /(shelly(?:plus|pro)?(?:plug(?:us|s)|1pm|dimmer2|pmmini|trv|ht|dw2|button1|motionsensor2|blu|em|3em|rgbw2|uni|i4|i4dc|valve|air|gas|flood|smokeplus|motionsensor|contact|window|vintage|duo|bulb|colorbulb|vintage|dimmer|roller|switch25|plug|4pro|em|1|1l|2.5|rgbw)-([0-9a-fA-F]{6,12}|[a-zA-Z0-9\-_]+))/i;
+    match = topic.match(shellyGenPattern);
+    if (match && match[2]) { // match[1] is the model part, match[2] is the ID/custom name
+        deviceId = match[2].toLowerCase();
+    } else {
+        // Pattern 2: Standard shellies/model-chipid/subtopic or shellies/chipid/subtopic (Gen1)
+        const standardShelliesPattern = /shellies\/(?:[a-zA-Z0-9\-_]+-)?([a-fA-F0-9]{6}|[a-fA-F0-9]{12})/;
+        match = topic.match(standardShelliesPattern);
+        if (match && match[1]) {
+            deviceId = match[1].toLowerCase();
+        }
+    }
+
+    if (!deviceId) {
+      console.log(`[MQTT Message] Could not extract deviceId from topic: ${topic}. Skipping further processing for this message.`);
+      return;
+    }
+    console.log(`[MQTT Message] Extracted Device ID: ${deviceId}. Topic: ${topic}.`);
+
+    let payload;
+    try {
+      payload = JSON.parse(msgString);
+    } catch (e) {
+      payload = msgString; // Handle non-JSON messages (e.g., simple 'ON'/'OFF')
+    }
+
+    // Determine the user associated with this device
+    const deviceDoc = await db.collection('devices').findOne({ id: deviceId });
+    if (!deviceDoc) {
+      console.warn(`[MQTT] Device '${deviceId}' (from topic: ${topic}) not registered by any user. Skipping user-specific data processing.`);
+      return; // If device isn't registered, don't process further for user-specific data
+    }
+    const userId = deviceDoc.userId.toString(); // Get userId as string
+
+    // --- Handle Telemetry Data (Power/Energy Readings) ---
+    if (topic.startsWith('tele/') && payload && typeof payload === 'object' && payload.ENERGY) {
+      await handleShellyPowerData(deviceId, userId, payload.ENERGY);
+    }
+    // --- Handle Status Data (Relay State) ---
+    else if (topic.startsWith('stat/')) {
+      const parts = topic.split('/'); // Define parts here before using in condition
+      if (parts.length > 2 && (parts[2] === 'POWER' || parts[2] === 'RELAY')) {
+      // This typically applies to Gen1 devices or simple status updates
+      const newStatus = (payload === 'ON' || (typeof payload === 'object' && payload.switch === true)); // For Gen1 (ON/OFF) or Gen2/3 RPC (switch.Set response)
+      await handleShellyStatus(deviceId, userId, newStatus);
+      } else {
+        console.log(`[MQTT] Unhandled stat/ message (subtopic not POWER or RELAY) - Topic: ${topic}`);
+      }
+    }
+    // Handle Shelly RPC status updates (Gen2/3) - NotifyStatus from /events/rpc or /rpc
+    else if (topic.includes('rpc') && payload && typeof payload === 'object' && payload.method === 'NotifyStatus' && payload.params && payload.params['switch:0']) {
+      console.log(`[DEBUG MQTT Handler] Matched NotifyStatus. Topic: ${topic}`);
+      const switchData = payload.params['switch:0'];
+      console.log(`[DEBUG MQTT Handler] switchData: ${JSON.stringify(switchData)}`);
+      // Pass output for status, apower for power, and aenergy.total for energy
+      // Only update on/off status if 'output' is present, otherwise pass undefined for newStatus
+      // to prevent overwriting the known on/off state with undefined.
+      const newDeviceStatus = typeof switchData.output === 'boolean' ? switchData.output : undefined;
+      await handleShellyStatus(deviceId, userId,
+        newDeviceStatus,
+        switchData.apower,
+        switchData.aenergy?.total);
+    }
+    // Handle Shelly RPC direct responses (less common for status, but good to have a general catch)
+    else if (topic.includes('rpc') && payload && typeof payload === 'object' && payload.result && typeof payload.result.on === 'boolean') { // Check for direct 'on' in result
+      const newStatus = payload.result.on;
+      await handleShellyStatus(deviceId, userId, newStatus);
+    }
+    // Handle specific Shelly Plus/Pro status updates if they differ and are not covered by generic RPC
+    // Example: shellies/shellyplusplugus-DEVICEID/status/switch:0 could be {"id":0,"source":"MQTT","output":true,"apower":60.0,"voltage":230.0,"current":0.280,"aenergy":{"total":12.345,...}}
+    else if (topic.includes('/status/switch:0') && payload && typeof payload === 'object' && typeof payload.output === 'boolean') {
+      await handleShellyStatus(deviceId, userId, payload.output, payload.apower, payload.aenergy?.total);
+    }
+    // Handle Shelly online/offline status (for device_status collection updates)
+    else if (topic.endsWith('online')) {
+      const onlineStatus = msgString === 'true';
+      await db.collection('device_status').updateOne(
+        { deviceId: deviceId },
+        { $set: { online: onlineStatus, lastSeen: new Date() } },
+        { upsert: true }
+      );
+      console.log(`[DB Update] Device '${deviceId}' online status updated to ${onlineStatus}.`);
+
+      // We will NOT send a device_status_update for 'online' messages, as 'status' refers to on/off state.
+      // If the app needs to know about MQTT online/offline, a different WebSocket message type should be used.
+    } else {
+      console.log(`[MQTT] Unhandled message - Topic: ${topic}, Message: ${msgString}`);
+    }
+  } catch (error) {
+    console.error('[MQTT Message Handler Error]', error);
+  }
+});
+
+// Function to handle Shelly power/energy data (typically from telemetry)
+async function handleShellyPowerData(deviceId, userId, energyPayload) {
+  try {
+    const power = typeof energyPayload.power === 'number' ? energyPayload.power : 0;
+    const totalEnergyWh = typeof energyPayload.total === 'number' ? energyPayload.total : 0; // Cumulative energy in Wh
+    const timeStamp = new Date(); // Timestamp of when the data was received
+
+    const newReading = {
+      deviceId,
+      userId: new ObjectId(userId), // Store userId as ObjectId
+      power,
+      energy: parseFloat((totalEnergyWh / 1000.0).toFixed(5)), // Convert Wh to kWh
+      timeStamp,
+    };
+    await db.collection(process.env.COLLECTION_NAME).insertOne(newReading);
+    console.log(`[DB Insert from Telemetry] Reading for ${deviceId} (${userId}): P ${power}W, E ${newReading.energy}kWh (Original from MQTT: ${totalEnergyWh}Wh)`);
+
+    // Update device_status lastSeen to indicate device is active
+    await db.collection('device_status').updateOne(
+      { deviceId: deviceId },
+      { $set: { online: true, lastSeen: timeStamp } },
+      { upsert: true }
+    );
+    // console.log(`[DB Update] Device '${deviceId}' lastSeen updated via telemetry.`); // Can be verbose
+
+    // Calculate and push the new total system power and latest energy
+    await calculateAndPushTotalSystemPower(userId);
+  } catch (error) {
+    console.error(`[handleShellyPowerData] Error processing data for ${deviceId}:`, error);
+  }
+}
+
+// Function to handle Shelly device status (on/off)
+// Can optionally receive power and energy if the status message includes them (e.g., some Shelly Plus/Pro status messages)
+async function handleShellyStatus(deviceId, userId, newStatus, currentPowerIfAvailable, cumulativeEnergyIfAvailable) {
+  try {
+    console.log(`[handleShellyStatus IN] Device: ${deviceId}, User: ${userId}, Received newStatus: ${newStatus}, Power: ${currentPowerIfAvailable}, Energy: ${cumulativeEnergyIfAvailable}`);
+
+    // Only update the on/off status in the 'devices' collection if newStatus is explicitly boolean (true/false)
+    if (typeof newStatus === 'boolean') {
+      console.log(`[handleShellyStatus DB-STATUS] Device: ${deviceId}. Explicit ON/OFF status received: ${newStatus}. Attempting DB update.`);
+      const result = await db.collection('devices').updateOne(
+        { id: deviceId, userId: new ObjectId(userId) },
+        { $set: { status: newStatus } }
+      );
+      if (result.matchedCount > 0) {
+        console.log(`[DB Update] Device '${deviceId}' ON/OFF status updated to ${newStatus}.`);
+      } else {
+        console.warn(`[DB Update] Device '${deviceId}' not found for user ${userId} during ON/OFF status update. No ON/OFF status change made in 'devices' collection.`);
+        // If the device isn't found for this user, we might not want to proceed with saving readings for it,
+        // or we might save readings without a strong user link if that's intended.
+        // For now, if the device isn't owned by the user, we'll still try to process power/energy if it came with the status.
+        // However, the WebSocket push for individual status might target the wrong user or no user if deviceDoc is not refetched.
+      }
+    } else {
+      console.log(`[handleShellyStatus DB-STATUS] Device: ${deviceId}. No explicit ON/OFF status received (newStatus is '${newStatus}'). ON/OFF status in DB will NOT be changed by this message.`);
+    }
+
+    let readingsWereUpdated = false;
+
+    // Always try to update power/energy readings if power is available, regardless of whether 'output' was in the message
+    if (typeof currentPowerIfAvailable === 'number') {
+      console.log(`[handleShellyStatus DB-READING] Device: ${deviceId}. Power data received: ${currentPowerIfAvailable}W. Attempting to save reading.`);
+      const timeStamp = new Date();
+      // Convert Wh to kWh for energy. If cumulativeEnergyIfAvailable is undefined, energyInKWh will be undefined.
+      const energyInKWh = typeof cumulativeEnergyIfAvailable === 'number'
+                          ? parseFloat((cumulativeEnergyIfAvailable / 1000.0).toFixed(5))
+                          : undefined;
+
+      await db.collection(process.env.COLLECTION_NAME).insertOne({
+        deviceId,
+        userId: new ObjectId(userId),
+        power: currentPowerIfAvailable, // This is the active power
+        energy: energyInKWh, // This is the cumulative energy in kWh
+        timeStamp,
+      });
+      console.log(`[DB Insert from Status] Reading for ${deviceId} (${userId}): P ${currentPowerIfAvailable}W${energyInKWh !== undefined ? `, E ${energyInKWh}kWh (Original from MQTT: ${cumulativeEnergyIfAvailable}Wh)` : ', Energy not in message'}`);
+      readingsWereUpdated = true;
+
+      // Update device_status lastSeen to indicate device is active (since we received some data)
+      await db.collection('device_status').updateOne(
+          { deviceId: deviceId },
+          { $set: { online: true, lastSeen: timeStamp } },
+          { upsert: true }
+        );
+      } else if (typeof currentPowerIfAvailable === 'undefined' && typeof cumulativeEnergyIfAvailable === 'number') {
+        // Case: Message has energy but no power (e.g. some NotifyStatus messages)
+        console.log(`[handleShellyStatus DB-READING] Device: ${deviceId}. Energy data received without power: ${cumulativeEnergyIfAvailable}Wh. Attempting to save reading with 0W power.`);
+        // We might still want to log this energy if it's useful, perhaps with power: 0 or null
+        const timeStamp = new Date();
+        const energyInKWh = parseFloat((cumulativeEnergyIfAvailable / 1000.0).toFixed(5));
+         await db.collection(process.env.COLLECTION_NAME).insertOne({
+            deviceId,
+            userId: new ObjectId(userId),
+            power: 0, // Or null, if preferred, when only energy is present
+            energy: energyInKWh,
+            timeStamp,
+        });
+        console.log(`[DB Insert from Status - Energy Only] Reading for ${deviceId} (${userId}): P 0W (assumed), E ${energyInKWh}kWh (Original from MQTT: ${cumulativeEnergyIfAvailable}Wh)`);
+        readingsWereUpdated = true;
+        await db.collection('device_status').updateOne(
+          { deviceId: deviceId },
+          { $set: { online: true, lastSeen: timeStamp } },
+          { upsert: true }
+        );
+      }
+    
+    if (typeof newStatus !== 'boolean' && !readingsWereUpdated) {
+      console.log(`[handleShellyStatus INFO] Device: ${deviceId}. No explicit ON/OFF status and no power/energy data in this message. No DB writes performed for device status or readings.`);
+    }
+
+    // Fetch the device again to get its current, potentially updated, on/off status for the WebSocket push
+    const deviceAfterUpdates = await db.collection('devices').findOne({ id: deviceId, userId: new ObjectId(userId) }, { projection: { name: 1, status: 1 } });
+    if (deviceAfterUpdates && activeWsConnections.has(userId)) {
+      const currentDeviceStatusForWS = typeof deviceAfterUpdates.status === 'boolean' ? deviceAfterUpdates.status : false;
+      console.log(`[handleShellyStatus WS-PUSH] Device: ${deviceId}. Current status in DB (for WS push): ${currentDeviceStatusForWS}`);
+      const statusUpdateMessage = JSON.stringify({ type: 'device_status_update', payload: { id: deviceId, name: deviceAfterUpdates.name, status: currentDeviceStatusForWS }});
+      activeWsConnections.get(userId).forEach(wsClient => { if (wsClient.readyState === WebSocket.OPEN) wsClient.send(statusUpdateMessage); });
+      console.log(`[WebSocket Push] Sent individual device status for ${deviceId} (DB status for WS: ${currentDeviceStatusForWS}) to user ${userId}.`);
+    }
+
+    // Always calculate and push total system power after any relevant data update
+    await calculateAndPushTotalSystemPower(userId);
+  } catch (error) {
+    console.error(`[handleShellyStatus] Error updating status for ${deviceId}:`, error);
+  }
+}
+
+// Helper function to calculate total system power for a user and push update
+async function calculateAndPushTotalSystemPower(userId) {
+  if (!db || !activeWsConnections.has(userId)) {
+    if(!db) console.warn("[calculateAndPushTotalSystemPower] DB not initialized.");
+    if(activeWsConnections.size > 0 && !activeWsConnections.has(userId)) console.warn(`[calculateAndPushTotalSystemPower] No active WebSocket connections for user ${userId}, though other users might be connected.`);
+    else if (activeWsConnections.size === 0) console.warn(`[calculateAndPushTotalSystemPower] No active WebSocket connections at all.`);
+    return;
+  }
+  console.log(`[DEBUG calculateAndPushTotalSystemPower] Calculating for User ID: ${userId}`);
+
+  let totalSystemPower = 0;
+  const userDevices = await db.collection('devices').find({ userId: new ObjectId(userId) }).toArray();
+  console.log(`[DEBUG calculateAndPushTotalSystemPower] Found ${userDevices.length} devices for user ${userId}.`);
+
+  for (const deviceDoc of userDevices) {
+    console.log(`[DEBUG calculateAndPushTotalSystemPower] Evaluating Device: ${deviceDoc.id}, Status in DB: ${deviceDoc.status}`);
+    if (deviceDoc.status === true) { // Only sum power for devices that are ON
+      const latestReading = await db.collection(process.env.COLLECTION_NAME)
+        .find({ deviceId: deviceDoc.id, userId: new ObjectId(userId) })
+        .sort({ timeStamp: -1 })
+        .limit(1)
+        .next();
+
+      if (latestReading && typeof latestReading.power === 'number') {
+        totalSystemPower += latestReading.power;
+        console.log(`[DEBUG calculateAndPushTotalSystemPower] Adding ${latestReading.power}W from ${deviceDoc.id} (Status: ON). Current total: ${totalSystemPower}W`);
+      } else {
+        console.log(`[DEBUG calculateAndPushTotalSystemPower] Device ${deviceDoc.id} (Status: ON) has no valid power reading. Latest reading: ${JSON.stringify(latestReading)}. Not adding to total.`);
+      }
+    } else {
+      console.log(`[DEBUG calculateAndPushTotalSystemPower] Device ${deviceDoc.id} (Status: ${deviceDoc.status}) is not ON (or status is not boolean true). Not adding to total.`);
+    }
+  }
+
+  const latestOverallEnergyReading = await db.collection(process.env.COLLECTION_NAME).find({ userId: new ObjectId(userId) }).sort({ timeStamp: -1 }).limit(1).next();
+  // Ensure representativeCumulativeEnergy is also treated as kWh
+  console.log(`[DEBUG calculateAndPushTotalSystemPower] Fetched latestOverallEnergyReading for user ${userId}:`, JSON.stringify(latestOverallEnergyReading));
+  const representativeCumulativeEnergy = latestOverallEnergyReading?.energy || 0; // Already in kWh if saved correctly
+  const timeStamp = new Date();
+
+  const messageToClients = JSON.stringify({
+    type: 'current_power_update',
+    payload: {
+      power: parseFloat(totalSystemPower.toFixed(3)),
+      energy: parseFloat(representativeCumulativeEnergy.toFixed(3)),
+      timeStamp: timeStamp.toISOString()
+    }
+  });
+
+  if (activeWsConnections.has(userId)) { // Double check user still has connections
+    activeWsConnections.get(userId).forEach(wsClient => {
+      if (wsClient.readyState === WebSocket.OPEN) {
+        wsClient.send(messageToClients);
+      }
+    });
+    console.log(`[WebSocket Push] Sent TOTAL system power update for user ${userId}: ${totalSystemPower.toFixed(3)}W, Energy: ${representativeCumulativeEnergy.toFixed(3)}kWh`);
+  } else {
+    console.log(`[WebSocket Push] User ${userId} no longer has active connections. Skipping TOTAL system power update.`);
+  }
+}
+
+// --- HTTP Server for Health Checks and WebSocket Upgrade ---
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', mongo: db ? 'connected' : 'disconnected', mqtt: mqttClient.connected ? 'connected' : 'disconnected', websockets: wss.clients.size }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+// Handle WebSocket upgrade requests
+server.on('upgrade', (request, socket, head) => {
+  const pathname = url.parse(request.url).pathname;
+  if (pathname === '/ws') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy(); // Reject non-WebSocket connections
+  }
+});
+
+
+// --- Start Server ---
+const startServer = async () => {
+  try {
+    await mongoClient.connect();
+    db = mongoClient.db(process.env.DB_NAME);
+    console.log('[mqttSubscriber.js] Connected to MongoDB.');
+
+    // Ensure necessary indexes
+    try {
+      await db.collection('devices').createIndex({ id: 1, userId: 1 }, { unique: true });
+      console.log("[mqttSubscriber.js] Index created/ensured on 'devices.id' and 'devices.userId'.");
+    } catch (indexError) {
+      console.warn("[mqttSubscriber.js] Could not create unique index on 'devices.id, userId' (may already exist):", indexError.message);
+    }
+    try {
+      await db.collection('device_status').createIndex({ deviceId: 1 }, { unique: true });
+      console.log("[mqttSubscriber.js] Index created/ensured on 'device_status.deviceId'.");
+    } catch (indexError) {
+      console.warn("[mqttSubscriber.js] Could not create unique index on 'device_status.deviceId' (may already exist):", indexError.message);
+    }
+    try {
+      await db.collection(process.env.COLLECTION_NAME).createIndex({ deviceId: 1, userId: 1, timeStamp: -1 });
+      console.log(`[mqttSubscriber.js] Index created/ensured on '${process.env.COLLECTION_NAME}' for deviceId, userId, and timeStamp.`);
+    } catch (indexError) {
+      console.warn(`[mqttSubscriber.js] Could not create compound index on '${process.env.COLLECTION_NAME}' (may already exist):`, indexError.message);
+    }
+
+    const PORT = process.env.MQTT_SUBSCRIBER_PORT || 3002;
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`[mqttSubscriber.js] HTTP/WebSocket server running on port ${PORT} and accessible externally. WS endpoint: ws://<your-ip>:${PORT}/ws`);
+    });
+
+  } catch (err) {
+    console.error('[mqttSubscriber.js] Failed to connect to MongoDB or start server:', err.message, err.stack);
+    process.exit(1);
+  }
+};
+
+startServer();
+
+
+
+
+
+
+
+
+
+
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class ApiService {
+  // Base URL for your backend server.
+  // This MUST match the IP address and port where your Node.js server.js is running.
+  // Example: 'http://192.168.100.5:3001'
+  static const String _baseServerUrl = 'http://192.168.100.5:3001';
+
+  // API base URL for general data endpoints
+  static const String baseUrl = '$_baseServerUrl/api';
+  // API base URL for authentication endpoints
+  static const String authUrl = '$_baseServerUrl/auth';
+
+  /// Fetches current overall power data for the authenticated user.
+  /// Corresponds to: `GET /api/power/current` in server.js
+  /// Expected response keys: `power`, `energy`, `timeStamp`
+  static Future<Map<String, dynamic>> getCurrentPowerData(String token) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/power/current'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load current power data: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load current power data');
+    }
+  }
+
+  /// Fetches historical overall power data for the authenticated user.
+  /// Corresponds to: `GET /api/power/history?hours={hours}` in server.js
+  /// Expected response: List of readings, each with `power`, `energy`, `timeStamp`, etc.
+  static Future<List<dynamic>> getHistoricalData(String token, {int hours = 24}) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/power/history?hours=$hours'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load historical data: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load historical data');
+    }
+  }
+
+  /// Fetches all devices registered to the authenticated user.
+  /// Corresponds to: `GET /api/devices` in server.js
+  /// Expected response: List of device objects, each with `id`, `name`, `status`, `userId`, etc.
+  static Future<List<dynamic>> getDevices(String token) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/devices'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load devices: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load devices');
+    }
+  }
+
+  /// Fetches MQTT devices that are online but not yet registered by any user.
+  /// Corresponds to: `GET /api/mqtt-devices` in server.js
+  /// Expected response: List of objects, each with an `id` field (e.g., `[{ "id": "shellyplugus-a0dd6c4a81fc" }]`)
+  static Future<List<dynamic>> getMqttDevices(String token) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/mqtt-devices'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load available MQTT devices: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load available MQTT devices');
+    }
+  }
+
+  /// Registers a new device for the authenticated user.
+  /// Corresponds to: `POST /api/devices` in server.js
+  /// Request body: `{'deviceId': deviceId, 'name': name}`
+  static Future<void> addDevice(String token, String deviceId, String name) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/devices'),
+      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+      body: json.encode({'deviceId': deviceId, 'name': name}),
+    );
+    if (response.statusCode == 201) {
+      print('Device added successfully.');
+    } else {
+      print('Failed to add device: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to add device: ${response.statusCode} ${response.body}');
+    }
+  }
+
+  /// Sends a control command (on/off) to a specific device.
+  /// Corresponds to: `POST /api/devices/{deviceId}` in server.js
+  /// Request body: `{'status': status}` (status is a boolean)
+  static Future<void> controlDevice(String token, String deviceId, bool status) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/devices/$deviceId'),
+      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
+      body: json.encode({'status': status}),
+    );
+    if (response.statusCode == 200) {
+      print('Device $deviceId controlled successfully.');
+    } else {
+      print('Failed to control device $deviceId: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to control device: ${response.statusCode} ${response.body}');
+    }
+  }
+
+  /// Removes a device registered to the authenticated user.
+  /// Corresponds to: `DELETE /api/devices/{deviceId}` in server.js
+  static Future<void> removeDevice(String token, String deviceId) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/devices/$deviceId'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      print('Device $deviceId removed successfully from backend.');
+    } else {
+      print('Failed to remove device $deviceId: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to remove device: ${response.statusCode} ${response.body}');
+    }
+  }
+
+  // --- API Methods for Device Detail Page ---
+
+  /// Fetches statistics for a specific device owned by the authenticated user.
+  /// Corresponds to: `GET /api/devices/{deviceId}/stats` in server.js
+  /// Expected response keys: `todayConsumed`, `yesterdayConsumed`, `status`, `thisMonthConsumed`, `allTimeConsumed`
+  static Future<Map<String, dynamic>> getDeviceStats(String token, String deviceId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/devices/$deviceId/stats'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load device stats for $deviceId: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load device stats');
+    }
+  }
+
+  /// Fetches daily consumption history for a specific device owned by the authenticated user.
+  /// Corresponds to: `GET /api/devices/{deviceId}/daily-history?days={days}` in server.js
+  /// Expected response: List of objects, each with `date` (string) and `consumed` (number)
+  static Future<List<dynamic>> getDeviceDailyHistory(String token, String deviceId, {int days = 7}) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/devices/$deviceId/daily-history?days=$days'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      print('Failed to load device daily history for $deviceId: ${response.statusCode} ${response.body}');
+      throw Exception('Failed to load device daily history');
+    }
+  }
+
+  // --- Authentication API Methods ---
+
+  /// Logs in a user.
+  /// Corresponds to: `POST /auth/login` in server.js
+  /// Request body: `{'email': email, 'password': password}`
+  /// Expected response: `{'token': '...', 'user': {'id': '...', 'name': '...', 'email': '...'}}`
+  static Future<Map<String, dynamic>> loginUser(String email, String password) async {
+    final response = await http.post(
+      Uri.parse('$authUrl/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'email': email, 'password': password}),
+    );
+    if (response.statusCode == 200) {
+      return json.decode(response.body); // Expects {'token': '...', 'user': {...}}
+    } else {
+      throw Exception('Failed to login: ${response.statusCode} ${response.body}');
+    }
+  }
+
+  /// Registers a new user.
+  /// Corresponds to: `POST /auth/signup` in server.js
+  /// Request body: `{'name': name, 'email': email, 'password': password}`
+  static Future<void> signupUser(String email, String password, String name) async {
+    final response = await http.post(
+      Uri.parse('$authUrl/signup'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'name': name, 'email': email, 'password': password}),
+    );
+    if (response.statusCode != 201 && response.statusCode != 200) { // 201 for created, 200 if it returns user
+      throw Exception('Failed to signup: ${response.statusCode} ${response.body}');
+    }
+    // No need to return data if signup doesn't auto-login or return user details
+  }
+}
